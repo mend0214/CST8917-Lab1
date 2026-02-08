@@ -6,6 +6,9 @@ import logging                  # Built-in Python library for printing log messa
 import json                     # Built-in Python library for working with JSON data
 import re                       # Built-in Python library for Regular Expressions (pattern matching)
 from datetime import datetime   # Built-in Python library for working with dates and times
+import uuid                               # NEW: For unique IDs
+from azure.cosmos import CosmosClient     # NEW: Cosmos DB SDK
+import os
 
 # =============================================================================
 # CREATE THE FUNCTION APP
@@ -13,6 +16,14 @@ from datetime import datetime   # Built-in Python library for working with dates
 # This creates our Function App with anonymous access (no authentication required)
 # Think of this as the "container" that holds all our functions
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+# =============================================================================
+# COSMOS DB CONFIGURATION
+# =============================================================================
+# These values come from Application Settings in Azure
+COSMOS_CONNECTION_STRING = "DATABASE_CONNECTION_STRING"
+DATABASE_NAME = "analysis"
+CONTAINER_NAME = "results"
 
 # =============================================================================
 # DEFINE THE TEXT ANALYZER FUNCTION
@@ -111,8 +122,8 @@ def TextAnalyzer(req: func.HttpRequest) -> func.HttpResponse:
         # =====================================================================
         # Create a Python dictionary with all our analysis results
         # This will be converted to JSON format
-        response_data = {
-            "analysis": {
+
+        analysis_result = {
                 "wordCount": word_count,
                 "characterCount": char_count,
                 "characterCountNoSpaces": char_count_no_spaces,
@@ -121,8 +132,8 @@ def TextAnalyzer(req: func.HttpRequest) -> func.HttpResponse:
                 "averageWordLength": avg_word_length,
                 "longestWord": longest_word,
                 "readingTimeMinutes": reading_time_minutes
-            },
-            "metadata": {
+            }
+        metadata ={
                 # datetime.utcnow() gets current time, isoformat() converts to string
                 # Example: "2024-01-15T14:30:00.000000"
                 "analyzedAt": datetime.utcnow().isoformat(),
@@ -132,7 +143,34 @@ def TextAnalyzer(req: func.HttpRequest) -> func.HttpResponse:
                 # This is called a "ternary operator" or "conditional expression"
                 "textPreview": text[:100] + "..." if len(text) > 100 else text
             }
+        response_data = {
+            "analysis": analysis_result,
+            "metadata": metadata
         }
+        # =========================================================================
+        # STEP 4: STORE RESULT IN COSMOS DB
+        # =========================================================================
+        record_id = str(uuid.uuid4())
+
+        document = {
+                "id": record_id,
+                "analysis": analysis_result,
+                "metadata": metadata,
+                "originalText": text
+        }
+
+        client = CosmosClient.from_connection_string(
+            conn_str=os.environ[COSMOS_CONNECTION_STRING]
+        )
+
+        database = client.get_database_client(DATABASE_NAME)
+        container = database.get_container_client(CONTAINER_NAME)
+
+        container.create_item(body=document)
+
+        # =========================================================================
+        # STEP 5: HANDLE MISSING TEXT (Error Response)
+        # =========================================================================
 
         # Return a successful HTTP response
         # json.dumps() converts Python dictionary to JSON string
@@ -144,10 +182,9 @@ def TextAnalyzer(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
-
-    # =========================================================================
-    # STEP 4: HANDLE MISSING TEXT (Error Response)
-    # =========================================================================
+        # =========================================================================
+        # STEP 5: HANDLE MISSING TEXT (Error Response)
+        # =========================================================================
     else:
         # If no text was provided, return helpful instructions
         instructions = {
@@ -166,3 +203,58 @@ def TextAnalyzer(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=400
         )
+    
+@app.route(route="GetAnalysisHistory", methods=["GET"])
+def GetAnalysisHistory(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("GetAnalysisHistory API was called")
+
+    # =========================================================================
+    # STEP 1: READ LIMIT QUERY PARAMETER
+    # =========================================================================
+    limit_param = req.params.get("limit")
+
+    try:
+        limit = int(limit_param) if limit_param else 10
+    except ValueError:
+        limit = 10
+
+    # Safety cap (prevents huge queries)
+    limit = min(limit, 50)
+
+    # =========================================================================
+    # STEP 2: CONNECT TO COSMOS DB
+    # =========================================================================
+    client = CosmosClient.from_connection_string(
+        os.environ[COSMOS_CONNECTION_STRING]
+    )
+
+    database = client.get_database_client(DATABASE_NAME)
+    container = database.get_container_client(CONTAINER_NAME)
+
+    # =========================================================================
+    # STEP 3: QUERY STORED ANALYSIS RECORDS
+    # =========================================================================
+    query = f"""
+        SELECT TOP {limit}
+            c.id,
+            c.analysis,
+            c.metadata
+        FROM c
+        ORDER BY c.metadata.analyzedAt DESC
+    """
+
+    items = container.query_items(
+        query=query,
+        enable_cross_partition_query=True
+    )
+
+    results = list(items)
+
+    # =========================================================================
+    # STEP 4: RETURN RESULTS
+    # =========================================================================
+    return func.HttpResponse(
+        json.dumps(results, indent=2),
+        mimetype="application/json",
+        status_code=200
+    )
